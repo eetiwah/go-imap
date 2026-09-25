@@ -1,6 +1,6 @@
 # go-imap
 
-> Fork of [emersion/go-imap](https://github.com/emersion/go-imap) v1.2.1 as `github.com/eetiwah/go-imap`, with two client patches: `NewWithOptions` and a recover in the reader loop. See NOTICE.
+> Fork of [emersion/go-imap](https://github.com/emersion/go-imap) v1.2.1 as `github.com/eetiwah/go-imap`, with four client patches: `NewWithOptions`, a recover in the reader loop, a handler lock that is released when a handler panics, and continuation signalling that costs no goroutine per server `+`. See NOTICE.
 
 [![godocs.io](https://godocs.io/github.com/emersion/go-imap?status.svg)](https://godocs.io/github.com/emersion/go-imap)
 [![builds.sr.ht status](https://builds.sr.ht/~emersion/go-imap/commits/master.svg)](https://builds.sr.ht/~emersion/go-imap/commits/master?)

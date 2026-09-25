@@ -3,8 +3,12 @@ github.com/eetiwah/go-imap is a fork of github.com/emersion/go-imap v1.2.1
 zip h1:+s9ZjMEjOB8NzZMVTM3cCenz2JrQIGGo5j1df19WjTA=), distributed under the
 upstream MIT License in LICENSE, whose copyright notices are unchanged.
 
-The fork's first commit is byte-identical to that release. The second changes
-only the module path. The third carries two patches to the client package:
+The fork's first commit is byte-identical to that release. The second
+rewrites the module path -- the module line in go.mod and every import of the
+module's own packages -- and rewords two server/server.go comments that linked
+the upstream wiki by URL, so that no Go file names the old path; they now name
+the wiki page. Nothing else in it changes. The later commits carry four
+patches to the client package:
 
   1. client.NewWithOptions, which applies imap.Reader.MaxLiteralSize, Updates
      and ErrorLog before the greeting is read and before the reader goroutine
@@ -13,3 +17,12 @@ only the module path. The third carries two patches to the client package:
   2. A recover in the client's reader loop, so a panic while handling a
      malformed server response closes the connection with an error instead of
      ending the process.
+  3. The response-handler lock is released by a deferred unlock, so a handler
+     that panics under it (patch 2's case) does not leave the next command
+     blocked in registerHandler.
+  4. The continuation signal is held in a channel with room for one and sent
+     without blocking, instead of by a goroutine per server "+" line. A
+     command discards a signal left from before it.
+
+Patches 1 and 2 are tagged v1.2.1-ntk.1; patches 3 and 4 are added in
+v1.2.1-ntk.2. Each patch has a test in client/ntk_patch_test.go.

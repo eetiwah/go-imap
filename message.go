@@ -200,10 +200,23 @@ func NewMessage(seqNum uint32, items []FetchItem) *Message {
 }
 
 // Parse a message from fields.
+//
+// A value that does not have its item's shape is refused with a parse error
+// rather than stored as its zero value: a UID or RFC822.SIZE that is not a
+// 32-bit number (a UID must also be non-zero), an INTERNALDATE that is not a
+// date-time string, a FLAGS member that is not a string, and a body section
+// that is not a string or NIL. So are a key with no value and a key that
+// occurs twice. A body section sent as a quoted string is kept, as a Literal
+// holding its text; one sent as NIL is kept as a nil Literal, so the key is in
+// Body either way and an absent section is not.
 func (m *Message) Parse(fields []interface{}) error {
 	m.Items = make(map[FetchItem]interface{})
 	m.Body = map[*BodySectionName]Literal{}
 	m.itemsOrder = nil
+
+	if len(fields)%2 != 0 {
+		return newParseError("cannot parse message: a key has no value")
+	}
 
 	var k FetchItem
 	for i, f := range fields {
@@ -215,6 +228,9 @@ func (m *Message) Parse(fields []interface{}) error {
 				k = FetchItem(strings.ToUpper(string(f)))
 			default:
 				return fmt.Errorf("cannot parse message: key is not a string, but a %T", f)
+			}
+			if _, seen := m.Items[k]; seen {
+				return newParseError("cannot parse message: a key occurs twice")
 			}
 		} else { // It's a value
 			m.Items[k] = nil
@@ -249,16 +265,34 @@ func (m *Message) Parse(fields []interface{}) error {
 
 				m.Flags = make([]string, len(flags))
 				for i, flag := range flags {
-					s, _ := ParseString(flag)
+					s, err := ParseString(flag)
+					if err != nil {
+						return newParseError("cannot parse message: a FLAGS member is not a flag")
+					}
 					m.Flags[i] = CanonicalFlag(s)
 				}
 			case FetchInternalDate:
-				date, _ := f.(string)
-				m.InternalDate, _ = time.Parse(DateTimeLayout, date)
+				date, ok := f.(string)
+				if !ok {
+					return newParseError("cannot parse message: INTERNALDATE is not a string")
+				}
+				t, err := time.Parse(DateTimeLayout, date)
+				if err != nil {
+					return newParseError("cannot parse message: INTERNALDATE is not a date-time")
+				}
+				m.InternalDate = t
 			case FetchRFC822Size:
-				m.Size, _ = ParseNumber(f)
+				size, err := ParseNumber(f)
+				if err != nil {
+					return newParseError("cannot parse message: RFC822.SIZE is not a 32-bit number")
+				}
+				m.Size = size
 			case FetchUid:
-				m.Uid, _ = ParseNumber(f)
+				uid, err := ParseNumber(f)
+				if err != nil || uid == 0 {
+					return newParseError("cannot parse message: UID is not a non-zero 32-bit number")
+				}
+				m.Uid = uid
 			default:
 				// Likely to be a section of the body
 				// First check that the section name is correct
@@ -266,7 +300,16 @@ func (m *Message) Parse(fields []interface{}) error {
 					// Not a section name, maybe an attribute defined in an IMAP extension
 					m.Items[k] = f
 				} else {
-					m.Body[section], _ = f.(Literal)
+					switch v := f.(type) {
+					case Literal:
+						m.Body[section] = v
+					case string:
+						m.Body[section] = bytes.NewBufferString(v)
+					case nil:
+						m.Body[section] = nil
+					default:
+						return newParseError("cannot parse message: a body section is not a string or NIL")
+					}
 				}
 			}
 		}

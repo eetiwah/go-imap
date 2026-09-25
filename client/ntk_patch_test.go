@@ -129,7 +129,7 @@ func TestNewWithOptionsDeliversAnUpdateSentWithTheGreeting(t *testing.T) {
 // not there, which panicked the process. Now the connection ends: LoggedOut
 // closes and a command returns an error.
 func TestAMalformedUnilateralResponseEndsTheConnectionNotTheProcess(t *testing.T) {
-	for _, resp := range []string{"* EXPUNGE\r\n", "* FETCH\r\n", "* 1 FETCH\r\n"} {
+	for _, resp := range []string{"* EXPUNGE\r\n", "* FETCH\r\n"} {
 		t.Run(strings.TrimSpace(resp), func(t *testing.T) {
 			c, s := net.Pipe()
 			defer s.Close()
@@ -171,7 +171,7 @@ func (deadlineIgnoringConn) SetDeadline(time.Time) error { return nil }
 // must be free afterwards: every command registers a handler under it, so a
 // lock left held makes the next command block for good instead of failing.
 func TestTheHandlerLockIsReleasedWhenAHandlerPanics(t *testing.T) {
-	for _, resp := range []string{"* EXPUNGE\r\n", "* FETCH\r\n", "* 1 FETCH\r\n"} {
+	for _, resp := range []string{"* EXPUNGE\r\n", "* FETCH\r\n"} {
 		t.Run(strings.TrimSpace(resp), func(t *testing.T) {
 			c, s := net.Pipe()
 			defer s.Close()
@@ -347,4 +347,158 @@ func TestATaggedRefusalIsAStatusErrorAndAHandlerFailureIsNot(t *testing.T) {
 			}
 		})
 	}
+}
+
+// fetchOnce runs one UID FETCH of UID 1 on a real client whose server answers
+// with the FETCH message data attr, and returns what the command returned.
+func fetchOnce(t *testing.T, attr string) ([]*imap.Message, error) {
+	t.Helper()
+	c, s := net.Pipe()
+	go scriptedServer(s, "IMAP4rev1", func(string) string { return "* 1 FETCH " + attr + "\r\nTAG OK done\r\n" })
+	cl, err := NewWithOptions(c, Options{ErrorLog: &captureLog{}})
+	if err != nil {
+		t.Fatalf("NewWithOptions: %v", err)
+	}
+	defer cl.Terminate()
+	setClientState(cl, imap.SelectedState, imap.NewMailboxStatus("INBOX", nil))
+	set := new(imap.SeqSet)
+	set.AddNum(1)
+	ch := make(chan *imap.Message, 4)
+	err = cl.UidFetch(set, []imap.FetchItem{imap.FetchUid}, ch)
+	var msgs []*imap.Message
+	for m := range ch {
+		msgs = append(msgs, m)
+	}
+	return msgs, err
+}
+
+// TestAFetchValueWithoutItsItemsShapeIsRefusedNotZeroed is patch (vi), the
+// solicited half. Upstream's Message.Parse discarded the error of every
+// conversion it made -- `m.Size, _ = ParseNumber(f)`, `m.Body[section], _ =
+// f.(Literal)` -- so a value without its item's shape arrived as that item's
+// zero value, and a body sent as a quoted string, which RFC 3501's nstring
+// permits, arrived as no body. Each shape below is from RFC 3501 section 9's
+// grammar for the item: the ones the grammar does not permit are refused by
+// the command's handler, and the permitted ones arrive as what was sent.
+func TestAFetchValueWithoutItsItemsShapeIsRefusedNotZeroed(t *testing.T) {
+	for _, attr := range []string{
+		"(UID x1)", "(UID 0)", "(UID 5000000000)", "(UID NIL)", "(UID (1))", "(UID {1}\r\n1)",
+		"(UID 1 RFC822.SIZE x)", "(UID 1 RFC822.SIZE 5000000000)", "(UID 1 RFC822.SIZE NIL)", "(UID 1 RFC822.SIZE (1))", "(UID 1 RFC822.SIZE {1}\r\n1)",
+		"(UID 1 INTERNALDATE x)", "(UID 1 INTERNALDATE \"2020-01-01T00:00:00Z\")", "(UID 1 INTERNALDATE NIL)", "(UID 1 INTERNALDATE (1))", "(UID 1 INTERNALDATE {26}\r\n01-Jan-2020 00:00:00 +0000)",
+		"(UID 1 FLAGS (NIL))", "(UID 1 FLAGS ((\\Seen)))",
+		"(UID 1 BODY[] (a b))",
+		"(UID 1 FLAGS)", "(UID 1 UID 2)",
+		"UID 1",
+	} {
+		t.Run(attr, func(t *testing.T) {
+			msgs, err := fetchOnce(t, attr)
+			var status *imap.ErrStatusResp
+			if err == nil || errors.As(err, &status) {
+				t.Fatalf("FETCH %q returned %d messages and error %v; want the handler's refusal", attr, len(msgs), err)
+			}
+		})
+	}
+	meta := func(m *imap.Message) string {
+		return fmt.Sprintf("%d %d %s %v", m.Uid, m.Size, m.InternalDate.UTC().Format(time.RFC3339), m.Flags)
+	}
+	for _, tc := range []struct {
+		attr   string
+		render func(*imap.Message) string
+		want   string
+	}{
+		{"(UID 1 RFC822.SIZE 100 INTERNALDATE \"01-Jan-2020 00:00:00 +0000\" FLAGS (\\Seen))", meta, "1 100 2020-01-01T00:00:00Z [\\Seen]"},
+		{"(UID 1 FLAGS ())", func(m *imap.Message) string { return fmt.Sprintf("nil=%v len=%d", m.Flags == nil, len(m.Flags)) }, "nil=false len=0"},
+		{"(UID 1 BODY[] {3}\r\nabc)", bodyText, `BODY[]="abc"`},
+		{"(UID 1 BODY[] \"abc\")", bodyText, `BODY[]="abc"`},
+		{"(UID 1 BODY[] \"\")", bodyText, `BODY[]=""`},
+		{"(UID 1 BODY[] NIL)", bodyText, "BODY[]=NIL"},
+		{"(UID 1)", bodyText, ""},
+		{"(UID 1 BODY[]<0> {3}\r\nabc)", bodyText, `BODY[]<0>="abc"`},
+		{"(UID 1 X-GM-MSGID 11)", func(m *imap.Message) string { return fmt.Sprintf("%v", m.Items["X-GM-MSGID"]) }, "11"},
+	} {
+		t.Run(tc.attr, func(t *testing.T) {
+			msgs, err := fetchOnce(t, tc.attr)
+			if err != nil || len(msgs) != 1 {
+				t.Fatalf("FETCH %q returned %d messages and error %v", tc.attr, len(msgs), err)
+			}
+			if got := tc.render(msgs[0]); got != tc.want {
+				t.Errorf("FETCH %q arrived as %q, want %q", tc.attr, got, tc.want)
+			}
+		})
+	}
+}
+
+// bodyText renders every body section m carries, NIL as NIL.
+func bodyText(m *imap.Message) string {
+	var parts []string
+	for section, lit := range m.Body {
+		name := string(section.FetchItem())
+		if lit == nil {
+			parts = append(parts, name+"=NIL")
+			continue
+		}
+		b, _ := io.ReadAll(lit)
+		parts = append(parts, fmt.Sprintf("%s=%q", name, b))
+	}
+	return strings.Join(parts, " ")
+}
+
+// TestAnUnsolicitedFetchOrExpungeThatDoesNotParseEndsTheConnection is patch
+// (vi), the unsolicited half. Upstream's handler for a unilateral FETCH
+// dropped one Message.Parse refused -- `if err := msg.Parse(fields); err != nil
+// { break }` -- and delivered an EXPUNGE whose number did not parse as
+// sequence number 0. Each is now returned to the reader, which ends the
+// connection: an update the client cannot read is an update it has lost, and
+// nothing after it can be placed. None of them may end it by a panic.
+func TestAnUnsolicitedFetchOrExpungeThatDoesNotParseEndsTheConnection(t *testing.T) {
+	for _, resp := range []string{
+		"* 1 FETCH (FLAGS NIL)", "* 1 FETCH (UID 0)", "* 1 FETCH (RFC822.SIZE x)", "* 1 FETCH FLAGS", "* 1 FETCH",
+		"* 0 FETCH (FLAGS ())", "* EXPUNGE x", "* 0 EXPUNGE",
+	} {
+		t.Run(resp, func(t *testing.T) {
+			c, s := net.Pipe()
+			defer s.Close()
+			go func() {
+				_, _ = io.WriteString(s, "* OK [CAPABILITY IMAP4rev1] ready\r\n"+resp+"\r\n")
+				_, _ = io.Copy(io.Discard, s)
+			}()
+			logs := &captureLog{}
+			cl, err := NewWithOptions(c, Options{ErrorLog: logs, Updates: make(chan Update, 4)})
+			if err != nil {
+				t.Fatalf("NewWithOptions: %v", err)
+			}
+			select {
+			case <-cl.LoggedOut():
+			case <-time.After(2 * time.Second):
+				t.Fatalf("the connection survived %q", resp)
+			}
+			if text := logs.text(); !strings.Contains(text, "cannot handle server response") || strings.Contains(text, "runtime error") {
+				t.Errorf("%q did not end the connection as a response the client could not handle, without a panic; it logged %q", resp, text)
+			}
+		})
+	}
+	t.Run("positive-control-a-well-formed-update-is-delivered", func(t *testing.T) {
+		c, s := net.Pipe()
+		defer s.Close()
+		go func() {
+			_, _ = io.WriteString(s, "* OK [CAPABILITY IMAP4rev1] ready\r\n* 1 FETCH (FLAGS (\\Seen))\r\n* 2 EXPUNGE\r\n")
+			_, _ = io.Copy(io.Discard, s)
+		}()
+		updates := make(chan Update, 4)
+		cl, err := NewWithOptions(c, Options{ErrorLog: &captureLog{}, Updates: updates})
+		if err != nil {
+			t.Fatalf("NewWithOptions: %v", err)
+		}
+		defer cl.Terminate()
+		for _, want := range []string{"*client.MessageUpdate", "*client.ExpungeUpdate"} {
+			select {
+			case u := <-updates:
+				if got := fmt.Sprintf("%T", u); got != want {
+					t.Errorf("got update %s, want %s", got, want)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("no %s arrived", want)
+			}
+		}
+	})
 }

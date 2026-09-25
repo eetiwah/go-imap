@@ -27,6 +27,10 @@ var errClosed = fmt.Errorf("imap: connection closed")
 // errUnregisterHandler is returned by a response handler to unregister itself.
 var errUnregisterHandler = fmt.Errorf("imap: unregister handler")
 
+// errZeroSeqNum is an EXPUNGE or FETCH whose message sequence number is 0,
+// which RFC 3501 section 9 does not permit (nz-number): no message has it.
+var errZeroSeqNum = fmt.Errorf("imap: message sequence number 0")
+
 // Update is an unilateral server update.
 type Update interface {
 	update()
@@ -177,8 +181,14 @@ func (c *Client) readOnce() (connected bool, err error) {
 		}
 	}
 
+	// A response a handler could not parse ends the connection, as a panic
+	// while handling one does (see the recover above): the update it carried
+	// is lost, and nothing the reader reads after it can be placed. The only
+	// handler that returns such an error is handleUnilateral's; a command's
+	// handler hands its error to the command instead.
 	if err := c.handle(resp); err != nil && err != responses.ErrUnhandled {
-		c.ErrorLog.Println("cannot handle response ", resp, err)
+		c.conn.Close()
+		return false, fmt.Errorf("imap: cannot handle server response: %w", err)
 	}
 	return true, nil
 }
@@ -467,18 +477,40 @@ func (c *Client) handleUnilateral() {
 					c.Updates <- &MailboxUpdate{c.Mailbox()}
 				}
 			case "EXPUNGE":
-				seqNum, _ := imap.ParseNumber(fields[0])
+				// A sequence number that does not parse is refused, not
+				// delivered as zero: 0 is no message's sequence number, and an
+				// EXPUNGE read as one is an EXPUNGE nobody can place.
+				seqNum, err := imap.ParseNumber(fields[0])
+				if err != nil {
+					return err
+				} else if seqNum == 0 {
+					return errZeroSeqNum
+				}
 
 				if c.Updates != nil {
 					c.Updates <- &ExpungeUpdate{seqNum}
 				}
 			case "FETCH":
-				seqNum, _ := imap.ParseNumber(fields[0])
-				fields, _ := fields[1].([]interface{})
+				// A FETCH that does not parse is returned to the reader, which
+				// logs it, rather than dropped: the update it carried would
+				// otherwise be lost with nothing to say so.
+				seqNum, err := imap.ParseNumber(fields[0])
+				if err != nil {
+					return err
+				} else if seqNum == 0 {
+					return errZeroSeqNum
+				}
+				if len(fields) < 2 {
+					return fmt.Errorf("imap: FETCH has no message data")
+				}
+				fields, ok := fields[1].([]interface{})
+				if !ok {
+					return fmt.Errorf("imap: FETCH message data is not a list")
+				}
 
 				msg := &imap.Message{SeqNum: seqNum}
 				if err := msg.Parse(fields); err != nil {
-					break
+					return err
 				}
 
 				if c.Updates != nil {

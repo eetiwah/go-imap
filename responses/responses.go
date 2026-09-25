@@ -12,6 +12,10 @@ var ErrUnhandled = errors.New("imap: unhandled response")
 
 var errNotEnoughFields = errors.New("imap: not enough fields in response")
 
+// errFetchNotAList is a FETCH response whose message data is not a
+// parenthesized list.
+var errFetchNotAList = errors.New("imap: FETCH message data is not a list")
+
 // Handler handles responses.
 type Handler interface {
 	// Handle processes a response. If the response cannot be processed,

@@ -18,7 +18,7 @@ func (r *Fetch) Handle(resp imap.Resp) error {
 	name, fields, ok := imap.ParseNamedResp(resp)
 	if !ok || name != fetchName {
 		return ErrUnhandled
-	} else if len(fields) < 1 {
+	} else if len(fields) < 2 {
 		return errNotEnoughFields
 	}
 
@@ -27,7 +27,10 @@ func (r *Fetch) Handle(resp imap.Resp) error {
 		return err
 	}
 
-	msgFields, _ := fields[1].([]interface{})
+	msgFields, ok := fields[1].([]interface{})
+	if !ok {
+		return errFetchNotAList
+	}
 	msg := &imap.Message{SeqNum: seqNum}
 	if err := msg.Parse(msgFields); err != nil {
 		return err

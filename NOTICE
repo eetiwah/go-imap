@@ -7,8 +7,8 @@ The fork's first commit is byte-identical to that release. The second
 rewrites the module path -- the module line in go.mod and every import of the
 module's own packages -- and rewords two server/server.go comments that linked
 the upstream wiki by URL, so that no Go file names the old path; they now name
-the wiki page. Nothing else in it changes. The later commits carry four
-patches to the client package:
+the wiki page. Nothing else in it changes. The later commits carry six
+patches, the first four to the client package:
 
   1. client.NewWithOptions, which applies imap.Reader.MaxLiteralSize, Updates
      and ErrorLog before the greeting is read and before the reader goroutine
@@ -24,5 +24,20 @@ patches to the client package:
      without blocking, instead of by a goroutine per server "+" line. A
      command discards a signal left from before it.
 
+  5. StatusResp.Err returns a tagged NO or BAD as an *ErrStatusResp, whose
+     text is the status info as before, so a caller can tell the server
+     refusing a command from a response handler failing to parse what the
+     server sent.
+  6. Message.Parse refuses a FETCH value without its item's shape -- a UID
+     or RFC822.SIZE that is not a 32-bit number (a UID must also be
+     non-zero), an INTERNALDATE that is not a date-time, a FLAGS member that
+     is not a string, a body section that is not a string or NIL, a key
+     with no value, a key that occurs twice -- instead of storing its zero
+     value, and keeps a body section sent as a quoted string. The handler
+     for unilateral responses returns an EXPUNGE or FETCH that does not
+     parse, or whose sequence number is 0, instead of dropping it or
+     delivering it as number 0, and the reader ends the connection on it.
+
 Patches 1 and 2 are tagged v1.2.1-ntk.1; patches 3 and 4 are added in
-v1.2.1-ntk.2. Each patch has a test in client/ntk_patch_test.go.
+v1.2.1-ntk.2; patches 5 and 6 in v1.2.1-ntk.3. Each patch has a test in
+client/ntk_patch_test.go.

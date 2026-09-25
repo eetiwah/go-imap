@@ -76,6 +76,11 @@ func (r *StatusResp) resp() {}
 
 // If this status is NO or BAD, returns an error with the status info.
 // Otherwise, returns nil.
+//
+// The error is an *ErrStatusResp carrying the status, so a caller can tell the
+// server refusing a command from anything else a command can fail with -- a
+// response handler that could not parse what the server sent, or the
+// connection ending -- with errors.As. Its text is the status info, as before.
 func (r *StatusResp) Err() error {
 	if r == nil {
 		// No status response, connection closed before we get one
@@ -83,7 +88,7 @@ func (r *StatusResp) Err() error {
 	}
 
 	if r.Type == StatusRespNo || r.Type == StatusRespBad {
-		return errors.New(r.Info)
+		return &ErrStatusResp{Resp: r}
 	}
 	return nil
 }

@@ -3,6 +3,7 @@ package client
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -280,5 +281,70 @@ func TestAServerContinuationCostsNoGoroutine(t *testing.T) {
 	_ = cl.Terminate()
 	if line := <-after; strings.Contains(line, "literal-bytes") {
 		t.Errorf("the literal was written to a server that sent no continuation for it: %q", line)
+	}
+}
+
+// scriptedServer greets over s with caps, then answers each command line with
+// the text reply returns for it, after replacing "TAG" with the command's tag.
+// It returns when reply returns "" or the client closes.
+func scriptedServer(s net.Conn, caps string, reply func(line string) string) {
+	defer s.Close()
+	r := bufio.NewReader(s)
+	if _, err := io.WriteString(s, "* PREAUTH [CAPABILITY "+caps+"] ready\r\n"); err != nil {
+		return
+	}
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return
+		}
+		out := reply(line)
+		if out == "" {
+			return
+		}
+		if _, err := io.WriteString(s, strings.ReplaceAll(out, "TAG", strings.Fields(line)[0])); err != nil {
+			return
+		}
+	}
+}
+
+// TestATaggedRefusalIsAStatusErrorAndAHandlerFailureIsNot is patch (v). A
+// tagged NO or BAD is returned as an *imap.ErrStatusResp whose text is the
+// status info, as upstream's errors.New(info) was; a response handler that
+// could not parse what the server sent returns an error that is NOT one. Upstream
+// returned both as untyped errors, so a caller had no way to tell a server
+// refusing the command from a response stream it could no longer trust.
+func TestATaggedRefusalIsAStatusErrorAndAHandlerFailureIsNot(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		reply  string
+		status bool
+	}{
+		{"NO", "TAG NO no such thing\r\n", true},
+		{"BAD", "TAG BAD not understood\r\n", true},
+		{"a FETCH the handler cannot parse", "* 1 FETCH (UID 1 BODYSTRUCTURE x)\r\nTAG OK done\r\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, s := net.Pipe()
+			go scriptedServer(s, "IMAP4rev1", func(string) string { return tc.reply })
+			cl, err := NewWithOptions(c, Options{ErrorLog: &captureLog{}})
+			if err != nil {
+				t.Fatalf("NewWithOptions: %v", err)
+			}
+			defer cl.Terminate()
+			setClientState(cl, imap.SelectedState, imap.NewMailboxStatus("INBOX", nil))
+			ch := make(chan *imap.Message, 4)
+			err = cl.UidFetch(new(imap.SeqSet), []imap.FetchItem{imap.FetchUid}, ch)
+			if err == nil {
+				t.Fatalf("UID FETCH answered %q returned no error", tc.reply)
+			}
+			var status *imap.ErrStatusResp
+			if got := errors.As(err, &status); got != tc.status {
+				t.Fatalf("UID FETCH answered %q returned %T %q; errors.As(*imap.ErrStatusResp) = %v, want %v", tc.reply, err, err, got, tc.status)
+			}
+			if tc.status && err.Error() != strings.TrimSpace(strings.SplitN(tc.reply, " ", 3)[2]) {
+				t.Errorf("the refusal's text is %q, want the status info", err.Error())
+			}
+		})
 	}
 }

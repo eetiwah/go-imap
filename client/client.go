@@ -142,7 +142,20 @@ func (c *Client) reader() {
 	}
 }
 
-func (c *Client) readOnce() (bool, error) {
+func (c *Client) readOnce() (connected bool, err error) {
+	// A panic while parsing or handling a server response ends the connection
+	// rather than the process. The response handlers index response fields
+	// they have not counted, so a malformed response from the server (for
+	// example an untagged EXPUNGE with no number) would otherwise panic on
+	// this goroutine, where no caller can recover it.
+	defer func() {
+		if r := recover(); r != nil {
+			connected = false
+			err = fmt.Errorf("imap: cannot handle server response: %v", r)
+			c.conn.Close()
+		}
+	}()
+
 	if c.State() == imap.LogoutState {
 		return false, nil
 	}
@@ -575,9 +588,32 @@ func (c *Client) SetDebug(w io.Writer) {
 
 // New creates a new client from an existing connection.
 func New(conn net.Conn) (*Client, error) {
+	return NewWithOptions(conn, Options{})
+}
+
+// Options configures a client before it reads anything from the server.
+//
+// Each field is applied before the greeting is read and before the reader
+// goroutine starts. Assigning Updates or ErrorLog after New returns races
+// with that goroutine, and imap.Reader.MaxLiteralSize cannot be set after New
+// at all: the reader is unexported, and the greeting and the first CAPABILITY
+// response are read inside New.
+type Options struct {
+	// MaxLiteralSize is imap.Reader.MaxLiteralSize. Zero means no limit.
+	MaxLiteralSize uint32
+	// Updates is Client.Updates.
+	Updates chan<- Update
+	// ErrorLog is Client.ErrorLog. Nil keeps the default logger.
+	ErrorLog imap.Logger
+}
+
+// NewWithOptions creates a new client from an existing connection, applying
+// opts before any server data is read.
+func NewWithOptions(conn net.Conn, opts Options) (*Client, error) {
 	continues := make(chan bool)
 	w := imap.NewClientWriter(nil, continues)
 	r := imap.NewReader(nil)
+	r.MaxLiteralSize = opts.MaxLiteralSize
 
 	c := &Client{
 		conn:      imap.NewConn(conn, r, w),
@@ -585,6 +621,10 @@ func New(conn net.Conn) (*Client, error) {
 		continues: continues,
 		state:     imap.ConnectingState,
 		ErrorLog:  log.New(os.Stderr, "imap/client: ", log.LstdFlags),
+		Updates:   opts.Updates,
+	}
+	if opts.ErrorLog != nil {
+		c.ErrorLog = opts.ErrorLog
 	}
 
 	c.handleContinuationReqs()

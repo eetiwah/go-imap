@@ -113,18 +113,21 @@ func (c *Client) registerHandler(h responses.Handler) {
 }
 
 func (c *Client) handle(resp imap.Resp) error {
+	// The handlers run under the lock, and a handler that panics on a
+	// malformed response unwinds through here to readOnce's recover. The
+	// unlock is deferred so the lock is released on that path too: otherwise
+	// the next command blocks for good in registerHandler.
 	c.handlersLocker.Lock()
+	defer c.handlersLocker.Unlock()
 	for i := len(c.handlers) - 1; i >= 0; i-- {
 		if err := c.handlers[i].Handle(resp); err != responses.ErrUnhandled {
 			if err == errUnregisterHandler {
 				c.handlers = append(c.handlers[:i], c.handlers[i+1:]...)
 				err = nil
 			}
-			c.handlersLocker.Unlock()
 			return err
 		}
 	}
-	c.handlersLocker.Unlock()
 	return responses.ErrUnhandled
 }
 

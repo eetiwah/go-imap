@@ -152,3 +152,61 @@ func TestAMalformedUnilateralResponseEndsTheConnectionNotTheProcess(t *testing.T
 		})
 	}
 }
+
+// deadlineIgnoringConn accepts a deadline on a closed connection. A command
+// that begins while the connection is still open has already set its deadline
+// by the time the reader fails; this conn puts a command started after the
+// failure at that same point, which is registerHandler.
+type deadlineIgnoringConn struct{ net.Conn }
+
+func (deadlineIgnoringConn) SetDeadline(time.Time) error { return nil }
+
+// TestTheHandlerLockIsReleasedWhenAHandlerPanics is patch (iii). The response
+// handlers run under handlersLocker, and each malformed response below panics
+// inside one of them. The reader's recover ends the connection, and the lock
+// must be free afterwards: every command registers a handler under it, so a
+// lock left held makes the next command block for good instead of failing.
+func TestTheHandlerLockIsReleasedWhenAHandlerPanics(t *testing.T) {
+	for _, resp := range []string{"* EXPUNGE\r\n", "* FETCH\r\n", "* 1 FETCH\r\n"} {
+		t.Run(strings.TrimSpace(resp), func(t *testing.T) {
+			c, s := net.Pipe()
+			defer s.Close()
+			go func() {
+				_, _ = io.WriteString(s, "* OK [CAPABILITY IMAP4rev1] ready\r\n"+resp)
+				_, _ = io.Copy(io.Discard, s)
+			}()
+			logs := &captureLog{}
+			cl, err := NewWithOptions(deadlineIgnoringConn{c}, Options{ErrorLog: logs})
+			if err != nil {
+				t.Fatalf("NewWithOptions: %v", err)
+			}
+			select {
+			case <-cl.LoggedOut():
+			case <-time.After(2 * time.Second):
+				t.Fatalf("the connection survived %q", resp)
+			}
+			if !strings.Contains(logs.text(), "cannot handle server response") {
+				t.Fatalf("the reader did not recover from %q, so this case tests nothing; it logged %q", resp, logs.text())
+			}
+			if cl.handlersLocker.TryLock() {
+				cl.handlersLocker.Unlock()
+			} else {
+				t.Errorf("handlersLocker is still held after the reader recovered from %q", resp)
+			}
+
+			done := make(chan error, 1)
+			go func() {
+				_, err := cl.Capability()
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Errorf("CAPABILITY on the ended connection succeeded")
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("CAPABILITY after the recover did not return within 2s")
+			}
+		})
+	}
+}

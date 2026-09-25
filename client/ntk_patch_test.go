@@ -2,6 +2,7 @@ package client
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -10,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/eetiwah/go-imap"
 )
 
 // declaredLiteral is the literal length the hostile server declares. It sends
@@ -208,5 +211,74 @@ func TestTheHandlerLockIsReleasedWhenAHandlerPanics(t *testing.T) {
 				t.Fatalf("CAPABILITY after the recover did not return within 2s")
 			}
 		})
+	}
+}
+
+// continuationFlood is how many "+" lines the hostile server sends in one
+// command's response. Upstream spent a goroutine on each, blocked for good.
+const continuationFlood = 2000
+
+// TestAServerContinuationCostsNoGoroutine is patch (iv). The server answers
+// CAPABILITY with continuationFlood "+" lines that no literal asked for.
+// Upstream's handler started a goroutine per line to deliver the signal, and
+// each one blocked on a channel nobody was reading; the count is taken with the
+// command complete and the connection still open, where those goroutines
+// would still be parked.
+//
+// The flood leaves a signal held, and the second half is that it does not
+// belong to the next command: an APPEND the server refuses without sending "+"
+// must fail without its literal being written. A stale signal would have
+// released the literal to a server that never asked for it.
+func TestAServerContinuationCostsNoGoroutine(t *testing.T) {
+	c, s := net.Pipe()
+	defer s.Close()
+	appendLine := make(chan string, 1)
+	after := make(chan string, 1)
+	go func() {
+		r := bufio.NewReader(s)
+		_, _ = io.WriteString(s, "* OK [CAPABILITY IMAP4rev1] ready\r\n")
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return
+		}
+		tag := strings.Fields(line)[0]
+		_, _ = io.WriteString(s, strings.Repeat("+ \r\n", continuationFlood)+"* CAPABILITY IMAP4rev1\r\n"+tag+" OK done\r\n")
+		line, err = r.ReadString('\n')
+		if err != nil {
+			return
+		}
+		appendLine <- line
+		_, _ = io.WriteString(s, strings.Fields(line)[0]+" NO refused\r\n")
+		line, _ = r.ReadString('\n')
+		after <- line
+	}()
+	cl, err := NewWithOptions(c, Options{ErrorLog: &captureLog{}})
+	if err != nil {
+		t.Fatalf("NewWithOptions: %v", err)
+	}
+	defer cl.Terminate()
+
+	runtime.GC()
+	before := runtime.NumGoroutine()
+	if _, err := cl.Capability(); err != nil {
+		t.Fatalf("CAPABILITY: %v", err)
+	}
+	runtime.GC()
+	grew := runtime.NumGoroutine() - before
+	t.Logf("%d continuation lines: goroutines %d -> %d", continuationFlood, before, before+grew)
+	if grew >= continuationFlood/10 {
+		t.Errorf("%d continuation lines left %d more goroutines running", continuationFlood, grew)
+	}
+
+	setClientState(cl, imap.AuthenticatedState, nil)
+	if err := cl.Append("INBOX", nil, time.Time{}, bytes.NewBufferString("literal-bytes")); err == nil {
+		t.Errorf("APPEND succeeded against a server that refused it")
+	}
+	if line := <-appendLine; !strings.Contains(line, "APPEND") {
+		t.Fatalf("the server read %q where it expected the APPEND", line)
+	}
+	_ = cl.Terminate()
+	if line := <-after; strings.Contains(line, "literal-bytes") {
+		t.Errorf("the literal was written to a server that sent no continuation for it: %q", line)
 	}
 }

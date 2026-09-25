@@ -67,7 +67,10 @@ type Client struct {
 	serverName string
 
 	loggedOut chan struct{}
-	continues chan<- bool
+	// continues carries the continuation signal to a literal write waiting
+	// for the server's "+". It holds at most one signal and nothing waits to
+	// deliver one: see handleContinuationReqs.
+	continues chan bool
 	upgrading bool
 
 	handlers       []responses.Handler
@@ -197,6 +200,14 @@ func (c *Client) execute(cmdr imap.Commander, h responses.Handler) (*imap.Status
 	cmd := cmdr.Command()
 	cmd.Tag = generateTag()
 
+	// A continuation signal still held from before this command belongs to no
+	// literal of this command: an unsolicited "+", or the cancellation an
+	// earlier command's completion left for a literal write it did not have.
+	select {
+	case <-c.continues:
+	default:
+	}
+
 	var replies <-chan []byte
 	if replier, ok := h.(responses.Replier); ok {
 		replies = replier.Replies()
@@ -232,6 +243,14 @@ func (c *Client) execute(cmdr imap.Commander, h responses.Handler) (*imap.Status
 		}
 
 		if s, ok := resp.(*imap.StatusResp); ok && s.Tag == cmd.Tag {
+			// Cancel any pending literal write. The signal is held until
+			// the write reaches its receive, so a write that has not got
+			// there yet is cancelled too; it is sent before the result is
+			// delivered, so the next command's discard sees it.
+			select {
+			case c.continues <- false:
+			default:
+			}
 			// This is the command's status response, we're done
 			doneHandle <- handleResult{s, nil}
 			// Special handling of connection upgrading.
@@ -239,11 +258,6 @@ func (c *Client) execute(cmdr imap.Commander, h responses.Handler) (*imap.Status
 				c.upgrading = false
 				// Wait for upgrade to finish.
 				c.conn.Wait()
-			}
-			// Cancel any pending literal write
-			select {
-			case c.continues <- false:
-			default:
 			}
 			return errUnregisterHandler
 		}
@@ -348,12 +362,18 @@ func (c *Client) Execute(cmdr imap.Commander, h responses.Handler) (*imap.Status
 	return c.execute(cmdr, h)
 }
 
+// handleContinuationReqs signals a literal write that the server sent "+".
+// The signal is held in continues, which has room for one, and a "+" that
+// finds it full is dropped: one signal is all a waiting write can use. Nothing
+// waits to deliver it, so a server that sends "+" lines nobody asked for costs
+// no goroutine.
 func (c *Client) handleContinuationReqs() {
 	c.registerHandler(responses.HandlerFunc(func(resp imap.Resp) error {
 		if _, ok := resp.(*imap.ContinuationReq); ok {
-			go func() {
-				c.continues <- true
-			}()
+			select {
+			case c.continues <- true:
+			default:
+			}
 			return nil
 		}
 		return responses.ErrUnhandled
@@ -613,7 +633,7 @@ type Options struct {
 // NewWithOptions creates a new client from an existing connection, applying
 // opts before any server data is read.
 func NewWithOptions(conn net.Conn, opts Options) (*Client, error) {
-	continues := make(chan bool)
+	continues := make(chan bool, 1)
 	w := imap.NewClientWriter(nil, continues)
 	r := imap.NewReader(nil)
 	r.MaxLiteralSize = opts.MaxLiteralSize

@@ -1,7 +1,7 @@
 package responses
 
 import (
-	"github.com/emersion/go-imap"
+	"github.com/eetiwah/go-imap"
 )
 
 const expungeName = "EXPUNGE"

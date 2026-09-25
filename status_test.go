@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/emersion/go-imap"
+	"github.com/eetiwah/go-imap"
 )
 
 func TestStatusResp_WriteTo(t *testing.T) {

@@ -5,8 +5,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/emersion/go-imap"
-	"github.com/emersion/go-imap/backend"
+	"github.com/eetiwah/go-imap"
+	"github.com/eetiwah/go-imap/backend"
 )
 
 type Backend struct {

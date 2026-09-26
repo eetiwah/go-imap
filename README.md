@@ -1,6 +1,6 @@
 # go-imap
 
-> Fork of [emersion/go-imap](https://github.com/emersion/go-imap) v1.2.1 as `github.com/eetiwah/go-imap`, with six patches: `NewWithOptions`, a recover in the reader loop, a handler lock that is released when a handler panics, continuation signalling that costs no goroutine per server `+`, a tagged NO or BAD returned as `*imap.ErrStatusResp`, and FETCH values refused rather than zeroed when they lack their item's shape. See NOTICE.
+> Fork of [emersion/go-imap](https://github.com/emersion/go-imap) v1.2.1 as `github.com/eetiwah/go-imap`, with seven patches: `NewWithOptions`, a recover in the reader loop, a handler lock that is released when a handler panics, continuation signalling that costs no goroutine per server `+`, a tagged NO or BAD returned as `*imap.ErrStatusResp`, FETCH values refused rather than zeroed when they lack their item's shape, and a command the server completed returned as completed when the connection ends after it. See NOTICE.
 
 [![godocs.io](https://godocs.io/github.com/emersion/go-imap?status.svg)](https://godocs.io/github.com/emersion/go-imap)
 [![builds.sr.ht status](https://builds.sr.ht/~emersion/go-imap/commits/master.svg)](https://builds.sr.ht/~emersion/go-imap/commits/master?)

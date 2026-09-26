@@ -7,7 +7,7 @@ The fork's first commit is byte-identical to that release. The second
 rewrites the module path -- the module line in go.mod and every import of the
 module's own packages -- and rewords two server/server.go comments that linked
 the upstream wiki by URL, so that no Go file names the old path; they now name
-the wiki page. Nothing else in it changes. The later commits carry six
+the wiki page. Nothing else in it changes. The later commits carry seven
 patches, the first four to the client package:
 
   1. client.NewWithOptions, which applies imap.Reader.MaxLiteralSize, Updates
@@ -37,7 +37,12 @@ patches, the first four to the client package:
      for unilateral responses returns an EXPUNGE or FETCH that does not
      parse, or whose sequence number is 0, instead of dropping it or
      delivering it as number 0, and the reader ends the connection on it.
+  7. A command the server completed before the connection ended is returned
+     as completed. execute selected between the command's result and the
+     reader ending at random when both were ready, and returned errClosed
+     for a command the server had completed; it now takes a waiting result
+     first.
 
 Patches 1 and 2 are tagged v1.2.1-ntk.1; patches 3 and 4 are added in
-v1.2.1-ntk.2; patches 5 and 6 in v1.2.1-ntk.3. Each patch has a test in
-client/ntk_patch_test.go.
+v1.2.1-ntk.2; patches 5 and 6 in v1.2.1-ntk.3; patch 7 in v1.2.1-ntk.4.
+Each patch has a test in client/ntk_patch_test.go.

@@ -325,6 +325,17 @@ func (c *Client) execute(cmdr imap.Commander, h responses.Handler) (*imap.Status
 			// realize this and don't block waiting on a response that will never
 			// come. loggedOut is a channel that closes when the reader goroutine
 			// ends.
+			//
+			// A command the server completed before the reader ended IS
+			// completed: the reader delivered its result to doneHandle before
+			// it ended, so the result is there to take. When both are ready
+			// this select chooses between them at random, so it is taken
+			// here rather than discarded as errClosed.
+			select {
+			case result := <-doneHandle:
+				return result.status, result.err
+			default:
+			}
 			close(unregister)
 			return nil, errClosed
 		case result := <-doneHandle:

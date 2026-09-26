@@ -502,3 +502,81 @@ func TestAnUnsolicitedFetchOrExpungeThatDoesNotParseEndsTheConnection(t *testing
 		}
 	})
 }
+
+// lateWriter is the client's end of the connection, holding each write's
+// return until the reader has ended: the command's bytes are on the wire at
+// once, and execute reaches its select only after the server has completed the
+// command, hung up, and the reader has seen both. That is the ordering the
+// defect needs, made certain rather than left to the scheduler, which lost it
+// in 1 of 300 rounds over loopback TCP.
+type lateWriter struct {
+	net.Conn
+	mu     sync.Mutex
+	client *Client
+}
+
+func (w *lateWriter) Write(p []byte) (int, error) {
+	n, err := w.Conn.Write(p)
+	w.mu.Lock()
+	cl := w.client
+	w.mu.Unlock()
+	if cl != nil {
+		select {
+		case <-cl.LoggedOut():
+		case <-time.After(2 * time.Second):
+		}
+	}
+	return n, err
+}
+
+// TestACommandThatCompletedIsReturnedCompletedWhenTheConnectionEndsAfter is
+// patch (vii). The server completes the command and hangs up at once, so by the
+// time execute looks, the command's result is waiting AND the reader has ended.
+// Upstream selected between the two at random and returned errClosed for a
+// command the server had completed -- measured through the connector's
+// FetchMetadata at 10 retrievals discarded in 60. A completed command is
+// returned as completed, every time.
+//
+// The positive control is the same server hanging up WITHOUT completing the
+// command: that is errClosed, so the test does not pass over an execute that
+// never reports a closed connection.
+func TestACommandThatCompletedIsReturnedCompletedWhenTheConnectionEndsAfter(t *testing.T) {
+	run := func(complete bool) error {
+		c, s := net.Pipe()
+		go func() {
+			defer s.Close()
+			_, _ = io.WriteString(s, "* OK [CAPABILITY IMAP4rev1] ready\r\n")
+			line, err := bufio.NewReader(s).ReadString('\n')
+			if err != nil {
+				return
+			}
+			if complete {
+				tag, _, _ := strings.Cut(line, " ")
+				_, _ = io.WriteString(s, tag+" OK NOOP completed\r\n")
+			}
+		}()
+		w := &lateWriter{Conn: c}
+		cl, err := NewWithOptions(w, Options{ErrorLog: &captureLog{}})
+		if err != nil {
+			t.Fatalf("NewWithOptions: %v", err)
+		}
+		defer cl.Terminate()
+		w.mu.Lock()
+		w.client = cl
+		w.mu.Unlock()
+		return cl.Noop()
+	}
+	const rounds = 200
+	failed := 0
+	for i := 0; i < rounds; i++ {
+		if err := run(true); err != nil {
+			failed++
+		}
+	}
+	if failed > 0 {
+		t.Errorf("%d of %d commands the server completed before hanging up were returned as %v", failed, rounds, errClosed)
+	}
+	if err := run(false); err != errClosed {
+		t.Errorf("a command the server did not complete before hanging up returned %v, want %v", err, errClosed)
+	}
+}

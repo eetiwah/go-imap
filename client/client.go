@@ -107,6 +107,9 @@ type Client struct {
 	//
 	// A Timeout of zero means no timeout. This is the default.
 	Timeout time.Duration
+
+	// beforeCommand is Options.BeforeCommand.
+	beforeCommand func() error
 }
 
 func (c *Client) registerHandler(h responses.Handler) {
@@ -207,6 +210,14 @@ type handleResult struct {
 }
 
 func (c *Client) execute(cmdr imap.Commander, h responses.Handler) (*imap.StatusResp, error) {
+	// The hook is asked before anything of the command exists: no tag, no
+	// handler, no deadline, no byte. A refusal is returned as it is.
+	if c.beforeCommand != nil {
+		if err := c.beforeCommand(); err != nil {
+			return nil, err
+		}
+	}
+
 	cmd := cmdr.Command()
 	cmd.Tag = generateTag()
 
@@ -671,6 +682,17 @@ type Options struct {
 	Updates chan<- Update
 	// ErrorLog is Client.ErrorLog. Nil keeps the default logger.
 	ErrorLog imap.Logger
+	// BeforeCommand, when set, is called at the start of every command the
+	// client sends -- the caller's, and the ones the library sends itself:
+	// the CAPABILITY Support asks inside New and after AUTHENTICATE, NOOP,
+	// LOGOUT, IDLE, and anything sent through Execute -- before a tag is
+	// generated or a byte is written. A non-nil error is returned by the
+	// command unwritten. The constructor discards the error of its own
+	// Support calls, as upstream does, so a refusal there leaves the
+	// capability cache empty and New returns no error. Continuation data
+	// (an AUTHENTICATE exchange, a literal) is written only inside a command
+	// the hook admitted. Nil means no hook, which is upstream's behaviour.
+	BeforeCommand func() error
 }
 
 // NewWithOptions creates a new client from an existing connection, applying
@@ -688,6 +710,8 @@ func NewWithOptions(conn net.Conn, opts Options) (*Client, error) {
 		state:     imap.ConnectingState,
 		ErrorLog:  log.New(os.Stderr, "imap/client: ", log.LstdFlags),
 		Updates:   opts.Updates,
+
+		beforeCommand: opts.BeforeCommand,
 	}
 	if opts.ErrorLog != nil {
 		c.ErrorLog = opts.ErrorLog

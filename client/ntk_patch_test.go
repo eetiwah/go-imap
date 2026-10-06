@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/emersion/go-sasl"
+
 	"github.com/eetiwah/go-imap"
 )
 
@@ -578,5 +580,247 @@ func TestACommandThatCompletedIsReturnedCompletedWhenTheConnectionEndsAfter(t *t
 	}
 	if err := run(false); err != errClosed {
 		t.Errorf("a command the server did not complete before hanging up returned %v, want %v", err, errClosed)
+	}
+}
+
+// errNotAdmitted is the refusal the hook under test returns.
+var errNotAdmitted = errors.New("the command was not admitted")
+
+// recordingServer greets with greeting and then records every byte the client
+// writes, until the client closes. written returns what it recorded once the
+// connection has ended.
+type recordingServer struct {
+	mu   sync.Mutex
+	buf  bytes.Buffer
+	done chan struct{}
+}
+
+func startRecordingServer(s net.Conn, greeting string) *recordingServer {
+	r := &recordingServer{done: make(chan struct{})}
+	go func() {
+		defer close(r.done)
+		defer s.Close()
+		if _, err := io.WriteString(s, greeting); err != nil {
+			return
+		}
+		b := make([]byte, 512)
+		for {
+			n, err := s.Read(b)
+			r.mu.Lock()
+			r.buf.Write(b[:n])
+			r.mu.Unlock()
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return r
+}
+
+func (r *recordingServer) written(t *testing.T) string {
+	t.Helper()
+	select {
+	case <-r.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the server never saw the connection end")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.buf.String()
+}
+
+// TestTheForkRefusesACommandBeforeWritingIt is patch (viii). Options.BeforeCommand
+// is called first in execute, the one place the client writes a command, and
+// its error is returned with nothing written: no byte reaches the server, no
+// response handler is registered for the command, and a continuation signal
+// the client was holding is not consumed -- nothing of the command's preamble
+// ran. The constructor's own CAPABILITY, which Support sends when the greeting
+// carried none, passes the hook too; the constructor discards Support's error,
+// as upstream does, so the refusal is seen there as a hook call and a silent
+// wire.
+//
+// The positive controls are the same commands under a hook that admits and
+// under no hook: each is written, so the refusal rows cannot pass over a
+// client that writes nothing at all.
+func TestTheForkRefusesACommandBeforeWritingIt(t *testing.T) {
+	t.Run("a-refused-command-writes-nothing", func(t *testing.T) {
+		c, s := net.Pipe()
+		srv := startRecordingServer(s, "* OK [CAPABILITY IMAP4rev1] ready\r\n")
+		var calls int
+		cl, err := NewWithOptions(c, Options{ErrorLog: &captureLog{}, BeforeCommand: func() error { calls++; return errNotAdmitted }})
+		if err != nil {
+			t.Fatalf("NewWithOptions: %v", err)
+		}
+		cl.handlersLocker.Lock()
+		handlers := len(cl.handlers)
+		cl.handlersLocker.Unlock()
+		cl.continues <- true
+		// A command that was written waits for an answer this server never
+		// sends, so it is given a bound and ended rather than left to hang.
+		done := make(chan error, 1)
+		go func() { done <- cl.Noop() }()
+		select {
+		case err = <-done:
+		case <-time.After(2 * time.Second):
+			_ = cl.Terminate()
+			err = <-done
+			t.Errorf("Noop under a refusing hook did not return until the connection was closed: it was sent and waited for an answer")
+		}
+		if !errors.Is(err, errNotAdmitted) {
+			t.Errorf("Noop under a refusing hook returned %v, want the hook's error", err)
+		}
+		if calls != 1 {
+			t.Errorf("the hook was called %d time(s) for one command, want 1", calls)
+		}
+		cl.handlersLocker.Lock()
+		after := len(cl.handlers)
+		cl.handlersLocker.Unlock()
+		if after != handlers {
+			t.Errorf("a refused command registered a response handler: %d before, %d after", handlers, after)
+		}
+		select {
+		case <-cl.continues:
+		default:
+			t.Errorf("a refused command consumed the continuation signal the client held: its preamble ran")
+		}
+		_ = cl.Terminate()
+		if got := srv.written(t); got != "" {
+			t.Errorf("a command was written after the hook refused it: the server received %q", got)
+		}
+	})
+	t.Run("the-constructors-capability-is-refused-unwritten", func(t *testing.T) {
+		c, s := net.Pipe()
+		srv := startRecordingServer(s, "* OK ready\r\n")
+		var calls int
+		// A constructor that sent CAPABILITY waits for an answer this server
+		// never sends, so it is given a bound and its connection closed.
+		type built struct {
+			cl  *Client
+			err error
+		}
+		done := make(chan built, 1)
+		go func() {
+			cl, err := NewWithOptions(c, Options{ErrorLog: &captureLog{}, BeforeCommand: func() error { calls++; return errNotAdmitted }})
+			done <- built{cl, err}
+		}()
+		var b built
+		select {
+		case b = <-done:
+		case <-time.After(2 * time.Second):
+			_ = c.Close()
+			b = <-done
+			t.Errorf("the constructor did not return until the connection was closed: its CAPABILITY was sent and waited for an answer")
+		}
+		cl, err := b.cl, b.err
+		if err != nil {
+			t.Fatalf("NewWithOptions: %v", err)
+		}
+		// Support("LITERAL+") and Support("LITERAL-") each ask CAPABILITY,
+		// because the refused first one cached nothing.
+		if calls != 2 {
+			t.Errorf("the constructor called the hook %d time(s), want 2 (its two Support calls)", calls)
+		}
+		_ = cl.Terminate()
+		if got := srv.written(t); got != "" {
+			t.Errorf("the constructor wrote %q after the hook refused its CAPABILITY", got)
+		}
+	})
+	for _, admit := range []bool{true, false} {
+		name := "positive-control-an-admitted-command-is-written"
+		if !admit {
+			name = "positive-control-no-hook-is-upstream"
+		}
+		t.Run(name, func(t *testing.T) {
+			c, s := net.Pipe()
+			srv := startRecordingServer(s, "* OK [CAPABILITY IMAP4rev1] ready\r\n")
+			var calls int
+			opts := Options{ErrorLog: &captureLog{}}
+			if admit {
+				opts.BeforeCommand = func() error { calls++; return nil }
+			}
+			cl, err := NewWithOptions(c, opts)
+			if err != nil {
+				t.Fatalf("NewWithOptions: %v", err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- cl.Noop() }()
+			select {
+			case <-done:
+			case <-time.After(200 * time.Millisecond):
+			}
+			_ = cl.Terminate()
+			<-done
+			if got := srv.written(t); !strings.Contains(got, " NOOP\r\n") {
+				t.Errorf("the server received %q, want a NOOP", got)
+			}
+			if admit && calls != 1 {
+				t.Errorf("the admitting hook was called %d time(s) for one command, want 1", calls)
+			}
+		})
+	}
+}
+
+// TestEveryCommandTheLibrarySendsPassesTheHookFirst drives the commands the
+// library sends that its caller never named -- the constructor's CAPABILITY,
+// Authenticate's Support("SASL-IR") answered from that cache, and the
+// CAPABILITY Support sends after AUTHENTICATE resets the cache -- and the
+// caller's own AUTHENTICATE and LOGOUT, under a hook that admits each. The hook
+// and the server write into one log, so the order is observed: every command
+// line the server read is immediately preceded by one hook call, and there is
+// no hook call that did not precede a command.
+func TestEveryCommandTheLibrarySendsPassesTheHookFirst(t *testing.T) {
+	c, s := net.Pipe()
+	var mu sync.Mutex
+	var events []string
+	logEvent := func(e string) {
+		mu.Lock()
+		events = append(events, e)
+		mu.Unlock()
+	}
+	go func() {
+		defer s.Close()
+		r := bufio.NewReader(s)
+		_, _ = io.WriteString(s, "* OK ready\r\n")
+		for {
+			line, err := r.ReadString('\n')
+			if err != nil {
+				return
+			}
+			f := strings.Fields(line)
+			if len(f) < 2 {
+				return
+			}
+			tag, verb := f[0], strings.ToUpper(f[1])
+			logEvent(verb)
+			switch verb {
+			case "CAPABILITY":
+				_, _ = io.WriteString(s, "* CAPABILITY IMAP4rev1 SASL-IR AUTH=PLAIN\r\n"+tag+" OK done\r\n")
+			case "LOGOUT":
+				_, _ = io.WriteString(s, "* BYE bye\r\n"+tag+" OK done\r\n")
+				return
+			default:
+				_, _ = io.WriteString(s, tag+" OK done\r\n")
+			}
+		}
+	}()
+	cl, err := NewWithOptions(c, Options{ErrorLog: &captureLog{}, BeforeCommand: func() error { logEvent("hook"); return nil }})
+	if err != nil {
+		t.Fatalf("NewWithOptions: %v", err)
+	}
+	defer cl.Terminate()
+	if err := cl.Authenticate(sasl.NewPlainClient("", "user", "pass")); err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+	if _, err := cl.Support("IDLE"); err != nil {
+		t.Fatalf("Support: %v", err)
+	}
+	if err := cl.Logout(); err != nil {
+		t.Fatalf("Logout: %v", err)
+	}
+	mu.Lock()
+	got := strings.Join(events, " ")
+	mu.Unlock()
+	if want := "hook CAPABILITY hook AUTHENTICATE hook CAPABILITY hook LOGOUT"; got != want {
+		t.Errorf("the hook and the server observed %q, want %q", got, want)
 	}
 }
